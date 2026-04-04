@@ -1,16 +1,27 @@
 # functions/promptagator_filter.py
 
 import os
+import json
 import torch
 from datasets import load_dataset
 
-@torch.inference_mode()  # Inference-/Eval-Modus, keine Gradienten nötig
-def filter_ai_dataset_topk(st_model, corpus, dataset_location, max_required_rank, device, asymmetric_encoder,
-                           backbone_name, doc_batchsize, q_batchsize):
-
+@torch.inference_mode()
+def filter_ai_dataset_topk(
+    st_model,
+    corpus,
+    dataset_location,
+    max_required_rank,
+    device,
+    asymmetric_encoder,
+    backbone_name,
+    doc_batchsize,
+    q_batchsize
+):
     # corpus: {chunk_id: passage_text}
-    doc_ids = list(corpus.keys())
-    doc_texts = [corpus[k] for k in doc_ids]
+    # Typen vereinheitlichen, damit chunk_id-Matches sicher funktionieren
+    doc_ids = [str(k) for k in corpus.keys()]
+    doc_texts = [corpus[k] for k in corpus.keys()]
+
     doc_emb = st_model.encode(
         doc_texts,
         batch_size=doc_batchsize,
@@ -19,42 +30,43 @@ def filter_ai_dataset_topk(st_model, corpus, dataset_location, max_required_rank
         show_progress_bar=True
     ).to(device)
 
-    docid2idx = {d: i for i, d in enumerate(doc_ids)}        # chunk_id -> row index in doc_emb
+    docid2idx = {d: i for i, d in enumerate(doc_ids)}
 
-    unfiltered_ds = load_dataset(                            # Laden des vollständigen synthetischen Datensatzes
+    unfiltered_ds = load_dataset(
         "json",
         data_files=f"{dataset_location}/train_dataset.json",
         split="train"
     )
 
-    qids, qtexts, qchunks = unfiltered_ds["id"], unfiltered_ds["anchor"], unfiltered_ds["chunk_id"]
-    kept = set()                                            # Set aller zu behaltenden Fragen
+    qids = unfiltered_ds["id"]
+    qtexts = unfiltered_ds["anchor"]
+    qchunks = [str(x) for x in unfiltered_ds["chunk_id"]]
 
-    for s in range(0, len(qids), q_batchsize):              # gehe Queries in Batches durch (in Schritten von q_batchsize)
-        b_qids   = qids[s:s + q_batchsize]                    # IDs dieses Query-Batches
-        b_qtexts = qtexts[s:s + q_batchsize]                  # Texte (Fragen) dieses Batches
-        b_chunks = qchunks[s:s + q_batchsize]                 # Gold chunk_id pro Query (entspricht corpus-key)
+    kept = set()
 
-        q_emb = st_model.encode(                              # Query-Embeddings für den ganzen Batch berechnen
+    # Absicherung: topk darf nicht größer als Anzahl Dokumente sein
+    k = min(max_required_rank, len(doc_ids))
+
+    for s in range(0, len(qids), q_batchsize):
+        b_qids = qids[s:s + q_batchsize]
+        b_qtexts = qtexts[s:s + q_batchsize]
+        b_chunks = qchunks[s:s + q_batchsize]
+
+        q_emb = st_model.encode(
             b_qtexts,
             batch_size=q_batchsize,
             convert_to_tensor=True,
-            normalize_embeddings=True,                        # L2-Norm → Cosine = Dot Product
+            normalize_embeddings=True,
             show_progress_bar=False
         ).to(device)
 
-        # Scores aller Queries gegen alle Dokumente: [Batch, Dim] @ [Dim, Docs] -> [Batch, Docs]
-        # Danach pro Query die Top-k Dokument-Indizes (Row-Indizes in doc_emb) holen
-        topk_idx = torch.topk(q_emb @ doc_emb.T, k=max_required_rank, dim=1).indices.cpu().tolist()
-        
-        for i, qid in enumerate(b_qids):                    # jede Query im Batch einzeln prüfen
-            gold_chunk = b_chunks[i]                          # korrekter Chunk (Key im corpus)
-            gold_idx = docid2idx.get(gold_chunk)              # Index dieses Chunks in doc_emb (Zeilennummer)
+        topk_idx = torch.topk(q_emb @ doc_emb.T, k=k, dim=1).indices.cpu().tolist()
 
+        for i, qid in enumerate(b_qids):
+            gold_idx = docid2idx.get(b_chunks[i])
             if gold_idx is not None and gold_idx in topk_idx[i]:
                 kept.add(qid)
 
-    # Behalte nur Datensatzeinträge, deren Query-ID im Set "kept" steht
     filtered_ds = unfiltered_ds.filter(lambda ex: ex["id"] in kept)
 
     if asymmetric_encoder:
@@ -63,7 +75,10 @@ def filter_ai_dataset_topk(st_model, corpus, dataset_location, max_required_rank
         out_path = f"datasets/GerManualDPR/filtered_synthetic/{backbone_name}/train_dataset.json"
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    filtered_ds.to_json(out_path, orient="records", lines=False, force_ascii=False)
 
-    print(f"kept={len(kept)}/{len(qids)} ({len(kept)/max(1,len(qids)):.2%}), saved: {out_path}")
-    return
+    # Explizit als EIN JSON-Array speichern
+    filtered_records = filtered_ds.to_list()
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(filtered_records, f, ensure_ascii=False, indent=2)
+
+    print(f"kept={len(kept)}/{len(qids)} ({len(kept)/max(1, len(qids)):.2%}), saved: {out_path}")
